@@ -4,9 +4,9 @@ import mysql from "mysql2/promise";
 import dotenv from "dotenv";
 import { Connection, Keypair, PublicKey } from "@solana/web3.js";
 import {
-    getOrCreateAssociatedTokenAccount,
-    transfer,
-    getMint,
+  getOrCreateAssociatedTokenAccount,
+  transfer,
+  getMint,
 } from "@solana/spl-token";
 import bs58 from "bs58";
 import nacl from "tweetnacl";
@@ -16,424 +16,800 @@ import { WebSocketServer } from "ws";
 
 dotenv.config();
 
-/* -------------------------------------------------------------------------- */
-/*                                EXPRESS SETUP                               */
-/* -------------------------------------------------------------------------- */
-
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-app.use(
-    cors({
-        origin: "*",
-        methods: ["GET", "POST", "OPTIONS"],
-        allowedHeaders: ["Content-Type", "Authorization"],
-    }) as any
-);
-app.use(express.json());
-
-/* -------------------------------------------------------------------------- */
-/*                             GOOGLE GEN AI CLIENT                            */
-/* -------------------------------------------------------------------------- */
-
+// Google GenAI Client
 const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
 
-/* -------------------------------------------------------------------------- */
-/*                                RATE LIMITER                                */
-/* -------------------------------------------------------------------------- */
+// Middlewares
+app.use(
+  cors({
+    origin: "*",
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+  }) as any
+);
+app.use(express.json() as any);
 
+// Simple Rate Limiter
 const rateLimitMap = new Map<
-    string,
-    { count: number; lastReset: number }
+  string,
+  { count: number; lastReset: number }
 >();
+app.use((req: any, res, next) => {
+  const ip = req.ip || "unknown";
+  const now = Date.now();
+  const WINDOW = 15 * 60 * 1000;
+  const LIMIT = 300;
 
-const rateLimitMiddleware = (
-    req: express.Request,
-    res: express.Response,
-    next: express.NextFunction
-) => {
-    const ip = (req as any).ip || "unknown";
-    const now = Date.now();
-    const WINDOW_MS = 15 * 60 * 1000;
-    const MAX_REQUESTS = 300;
+  const record = rateLimitMap.get(ip) || {
+    count: 0,
+    lastReset: now,
+  };
 
-    const record = rateLimitMap.get(ip) || { count: 0, lastReset: now };
+  if (now - record.lastReset > WINDOW) {
+    record.count = 0;
+    record.lastReset = now;
+  }
 
-    if (now - record.lastReset > WINDOW_MS) {
-        record.count = 0;
-        record.lastReset = now;
-    }
+  if (record.count >= LIMIT) {
+    return res.status(429).json({
+      error: "Too many requests, slow down.",
+    });
+  }
 
-    if (record.count >= MAX_REQUESTS) {
-        return res
-            .status(429)
-            .json({ error: "Too many requests, try again later." });
-    }
-
-    record.count++;
-    rateLimitMap.set(ip, record);
-    next();
-};
-
-app.use(rateLimitMiddleware);
-
-/* -------------------------------------------------------------------------- */
-/*                                DATABASE SETUP                               */
-/* -------------------------------------------------------------------------- */
-
-const pool = mysql.createPool({
-    uri: process.env.DATABASE_URL,
-    host: process.env.DB_HOST,
-    user: process.env.DB_USER,
-    password: process.env.DB_PASSWORD,
-    database: process.env.DB_NAME,
-    waitForConnections: true,
-    connectionLimit: 10,
+  record.count++;
+  rateLimitMap.set(ip, record);
+  next();
 });
 
-pool.getConnection()
-    .then((conn) => {
-        console.log("✅ MySQL Connected");
-        conn.release();
-    })
-    .catch((err) => {
-        console.error("❌ MySQL Connection Failed:", err.message);
-    });
+// MySQL
+const pool = mysql.createPool({
+  uri: process.env.DATABASE_URL,
+  host: process.env.DB_HOST,
+  user: process.env.DB_USER,
+  password: process.env.DB_PASSWORD,
+  database: process.env.DB_NAME,
+  waitForConnections: true,
+  connectionLimit: 10,
+  enableKeepAlive: true,
+});
 
-/* -------------------------------------------------------------------------- */
-/*                            SOLANA RPC / WALLET                              */
-/* -------------------------------------------------------------------------- */
+// Test DB
+pool
+  .getConnection()
+  .then((c) => {
+    console.log("✅ MySQL OK");
+    c.release();
+  })
+  .catch((e) => {
+    console.error("❌ DB error", e.message);
+  });
 
+// RPC Fallbacks
 const RPC_ENDPOINTS = [
-    process.env.SOLANA_RPC,
-    "https://api.mainnet-beta.solana.com",
-    "https://solana-mainnet.g.alchemy.com/v2/demo",
-    "https://rpc.ankr.com/solana",
+  process.env.SOLANA_RPC,
+  "https://api.mainnet-beta.solana.com",
+  "https://solana-mainnet.g.alchemy.com/v2/demo",
+  "https://rpc.ankr.com/solana",
 ].filter(Boolean) as string[];
 
+const getConnection = async () => {
+  for (const rpc of RPC_ENDPOINTS) {
+    try {
+      const conn = new Connection(rpc, "confirmed");
+      await conn.getSlot();
+      console.log("Connected RPC:", rpc);
+      return conn;
+    } catch (_) {}
+  }
+  return new Connection(
+    "https://api.mainnet-beta.solana.com",
+    "confirmed"
+  );
+};
+
 let connection: Connection;
-
-async function getConnection(): Promise<Connection> {
-    for (const rpc of RPC_ENDPOINTS) {
-        try {
-            const conn = new Connection(rpc, "confirmed");
-            await conn.getSlot();
-            console.log(`Connected to RPC: ${rpc}`);
-            return conn;
-        } catch {
-            console.warn(`RPC failed: ${rpc}`);
-        }
-    }
-    return new Connection("https://api.mainnet-beta.solana.com", "confirmed");
-}
-
 getConnection().then((c) => (connection = c));
 
 const TBOT_MINT = new PublicKey(
-    "7zsocfctvwecd4y4rpehzhweeoftzu7rgjikfjnstbe2"
+  "7zsocfctvwecd4y4rpehzhweeoftzu7rgjikfjnstbe2"
 );
 const NEUTS_MINT = new PublicKey(
-    "GyekgaVcTKiAk2VLgPa1UwMx8a5PMF4ssfqfcev9pump"
+  "GyekgaVcTKiAk2VLgPa1UwMx8a5PMF4ssfqfcev9pump"
 );
 const TOKEN_PROGRAM_ID = new PublicKey(
-    "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+  "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
 );
 
-let hotWalletKeypair: Keypair | undefined;
-let TREASURY_WALLET: string | undefined;
+// Hot Wallet
+let hotWalletKeypair: Keypair | null = null;
+let TREASURY_WALLET: string | null = null;
 
-try {
-    if (process.env.SOLANA_PRIVATE_KEY) {
-        const secret = process.env.SOLANA_PRIVATE_KEY.includes("[")
-            ? Uint8Array.from(JSON.parse(process.env.SOLANA_PRIVATE_KEY))
-            : bs58.decode(process.env.SOLANA_PRIVATE_KEY);
-        hotWalletKeypair = Keypair.fromSecretKey(secret);
-        TREASURY_WALLET = hotWalletKeypair.publicKey.toString();
-        console.log("🔥 Treasury Wallet:", TREASURY_WALLET);
-    } else {
-        console.warn("⚠ Missing SOLANA_PRIVATE_KEY — bridge disabled.");
-    }
-} catch (e) {
-    console.error("❌ Failed to load treasury wallet:", e);
+if (process.env.SOLANA_PRIVATE_KEY) {
+  const secret = process.env.SOLANA_PRIVATE_KEY.includes("[")
+    ? Uint8Array.from(JSON.parse(process.env.SOLANA_PRIVATE_KEY))
+    : bs58.decode(process.env.SOLANA_PRIVATE_KEY);
+
+  hotWalletKeypair = Keypair.fromSecretKey(secret);
+  TREASURY_WALLET = hotWalletKeypair.publicKey.toString();
+  console.log("🔥 Treasury Wallet:", TREASURY_WALLET);
+} else {
+  console.log(
+    "⚠️ No private key — bridge withdrawals disabled"
+  );
 }
 
-/* -------------------------------------------------------------------------- */
-/*                              WEBSOCKET SERVER                               */
-/* -------------------------------------------------------------------------- */
+// -----------------------------
+// ACTIVE USER FIX (NEW SYSTEM)
+// -----------------------------
+async function setUserOnline(wallet: string) {
+  await pool.query(
+    `
+    INSERT INTO active_users (wallet_address)
+    VALUES (?)
+    ON DUPLICATE KEY UPDATE last_active = NOW()
+  `,
+    [wallet]
+  );
+
+  updateActiveUserBroadcast();
+}
+
+async function setUserOffline(wallet: string) {
+  await pool.query(
+    `DELETE FROM active_users WHERE wallet_address = ?`,
+    [wallet]
+  );
+
+  updateActiveUserBroadcast();
+}
+
+let lastActiveCount = 0;
+
+async function updateActiveUserBroadcast() {
+  const [rows]: any = await pool.query(
+    `SELECT COUNT(*) AS count FROM active_users`
+  );
+
+  const count = rows[0].count;
+  const delta = count - lastActiveCount;
+
+  lastActiveCount = count;
+
+  const msg = JSON.stringify({
+    type: "activeUsers",
+    count,
+    delta,
+  });
+
+  wss.clients.forEach((client: any) => {
+    if (client.readyState === 1) client.send(msg);
+  });
+  console.log("📡 Active Users:", count, "Δ", delta);
+}
+
+// ------------------------------------------------------
+//                  API HANDLERS
+// ------------------------------------------------------
+
+const healthHandler = (req: any, res: any) => {
+  res.json({ status: "ok", time: new Date() });
+};
+
+const statsHandler = async (req: any, res: any) => {
+  try {
+    const [[memes]]: any = await pool.query(
+      "SELECT COUNT(*) AS count FROM memes"
+    );
+    const [[nfts]]: any = await pool.query(
+      "SELECT COUNT(*) AS count FROM nfts"
+    );
+    const [[active]]: any = await pool.query(
+      "SELECT COUNT(*) AS count FROM active_users"
+    );
+
+    res.json({
+      memesForged: memes.count,
+      nftsMinted: nfts.count,
+      activeUsers: active.count,
+    });
+  } catch (e) {
+    res.json({ memesForged: 0, nftsMinted: 0, activeUsers: 0 });
+  }
+};
+
+// ---------------- AUTH -----------------
+
+const loginHandler = async (req: any, res: any) => {
+  const { walletAddress } = req.body;
+  if (!walletAddress)
+    return res.status(400).json({ error: "Wallet required" });
+
+  try {
+    await pool.query(
+      `
+      INSERT INTO users (wallet_address, last_login)
+      VALUES (?, NOW())
+      ON DUPLICATE KEY UPDATE last_login = NOW()
+    `,
+      [walletAddress]
+    );
+
+    await setUserOnline(walletAddress);
+
+    res.json({ success: true });
+  } catch (e) {
+    console.error("Login error:", e);
+    res.status(500).json({ error: "DB error" });
+  }
+};
+
+const logoutHandler = async (req: any, res: any) => {
+  const { walletAddress } = req.body;
+  if (!walletAddress)
+    return res.status(400).json({ error: "Wallet required" });
+
+  try {
+    await setUserOffline(walletAddress);
+    res.json({ success: true });
+  } catch (e) {
+    console.error("Logout error:", e);
+    res.status(500).json({ error: "DB error" });
+  }
+};
+
+// ---------------- BALANCE -----------------
+
+const balanceHandler = async (req: any, res: any) => {
+  const { wallet } = req.body;
+  if (!wallet) return res.status(400).json({ error: "Wallet required" });
+
+  try {
+    const pk = new PublicKey(wallet);
+
+    let solBalance = 0;
+    let walletTbotBalance = 0;
+    let walletNeutsBalance = 0;
+
+    try {
+      if (!connection) connection = await getConnection();
+
+      solBalance = (await connection.getBalance(pk)) / 1e9;
+
+      const accounts = await connection.getParsedTokenAccountsByOwner(pk, {
+        programId: TOKEN_PROGRAM_ID,
+      });
+
+      for (const acc of accounts.value) {
+        const info = acc.account.data.parsed.info;
+        const mint = info.mint;
+        const amount = info.tokenAmount.uiAmount;
+
+        if (mint === TBOT_MINT.toString()) walletTbotBalance = amount;
+        if (mint === NEUTS_MINT.toString()) walletNeutsBalance = amount;
+      }
+    } catch (_) {}
+
+    const [rows]: any = await pool.query(
+      "SELECT tbot_balance, neuts_balance FROM users WHERE wallet_address = ?",
+      [wallet]
+    );
+
+    const row = rows[0] || {
+      tbot_balance: 0,
+      neuts_balance: 0,
+    };
+
+    res.json({
+      solBalance,
+      walletTbotBalance,
+      walletNeutsBalance,
+      tbotBalance: parseFloat(row.tbot_balance),
+      neutsBalance: parseFloat(row.neuts_balance),
+    });
+  } catch (e) {
+    res.json({
+      solBalance: 0,
+      walletTbotBalance: 0,
+      walletNeutsBalance: 0,
+      tbotBalance: 0,
+      neutsBalance: 0,
+    });
+  }
+};
+
+// ---------------- DEPOSIT VERIFY -----------------
+
+const depositVerifyHandler = async (req: any, res: any) => {
+  const { wallet, txHash } = req.body;
+  if (!wallet || !txHash)
+    return res.status(400).json({ error: "Missing fields" });
+
+  try {
+    const [existing]: any = await pool.query(
+      "SELECT id FROM deposits WHERE tx_hash = ?",
+      [txHash]
+    );
+    if (existing.length > 0)
+      return res.status(400).json({ error: "Already processed" });
+
+    if (!connection) connection = await getConnection();
+
+    const tx = await connection.getParsedTransaction(txHash, {
+      commitment: "confirmed",
+      maxSupportedTransactionVersion: 0,
+    });
+
+    if (!tx) return res.status(400).json({ error: "TX not found" });
+    if (tx.meta?.err)
+      return res.status(400).json({ error: "TX failed" });
+
+    if (!TREASURY_WALLET)
+      return res.status(500).json({ error: "Treasury missing" });
+
+    const pre = tx.meta?.preTokenBalances || [];
+    const post = tx.meta?.postTokenBalances || [];
+
+    const treasuryPre = pre.find(
+      (b) =>
+        b.owner === TREASURY_WALLET &&
+        b.mint === TBOT_MINT.toString()
+    );
+    const treasuryPost = post.find(
+      (b) =>
+        b.owner === TREASURY_WALLET &&
+        b.mint === TBOT_MINT.toString()
+    );
+
+    const before = treasuryPre?.uiTokenAmount?.uiAmount || 0;
+    const after = treasuryPost?.uiTokenAmount?.uiAmount || 0;
+
+    const diff = after - before;
+    if (diff <= 0)
+      return res.status(400).json({ error: "No deposit detected" });
+
+    await pool.query(
+      "INSERT INTO deposits (tx_hash, wallet, amount) VALUES (?, ?, ?)",
+      [txHash, wallet, diff]
+    );
+
+    await pool.query(
+      "UPDATE users SET tbot_balance = tbot_balance + ? WHERE wallet_address = ?",
+      [diff, wallet]
+    );
+
+    res.json({ success: true, added: diff });
+  } catch (e: any) {
+    res.status(500).json({ error: e.message });
+  }
+};
+
+// ---------------- WITHDRAW -----------------
+
+const withdrawHandler = async (req: any, res: any) => {
+  const { wallet, amount, signature, message } = req.body;
+  if (!wallet || !amount || !signature || !message)
+    return res.status(400).json({ error: "Missing fields" });
+
+  try {
+    const msgBytes = new TextEncoder().encode(message);
+    const sigBytes = bs58.decode(signature);
+    const pubBytes = new PublicKey(wallet).toBytes();
+
+    if (!nacl.sign.detached.verify(msgBytes, sigBytes, pubBytes))
+      return res.status(400).json({ error: "Invalid signature" });
+
+    const [rows]: any = await pool.query(
+      "SELECT tbot_balance FROM users WHERE wallet_address = ?",
+      [wallet]
+    );
+    const user = rows[0];
+    if (!user || user.tbot_balance < amount)
+      return res.status(400).json({ error: "Insufficient balance" });
+
+    if (!hotWalletKeypair)
+      return res.status(503).json({ error: "Treasury unavailable" });
+
+    if (!connection) connection = await getConnection();
+
+    await pool.query(
+      "UPDATE users SET tbot_balance = tbot_balance - ? WHERE wallet_address = ?",
+      [amount, wallet]
+    );
+
+    try {
+      const mintInfo = await getMint(connection, TBOT_MINT);
+      const raw = BigInt(
+        Math.floor(amount * 10 ** mintInfo.decimals)
+      );
+
+      const fromAcc = await getOrCreateAssociatedTokenAccount(
+        connection,
+        hotWalletKeypair,
+        TBOT_MINT,
+        hotWalletKeypair.publicKey
+      );
+      const toAcc = await getOrCreateAssociatedTokenAccount(
+        connection,
+        hotWalletKeypair,
+        TBOT_MINT,
+        new PublicKey(wallet)
+      );
+
+      await transfer(
+        connection,
+        hotWalletKeypair,
+        fromAcc.address,
+        toAcc.address,
+        hotWalletKeypair.publicKey,
+        raw
+      );
+    } catch (err) {
+      await pool.query(
+        "UPDATE users SET tbot_balance = tbot_balance + ? WHERE wallet_address = ?",
+        [amount, wallet]
+      );
+      throw err;
+    }
+
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: "Withdraw failed" });
+  }
+};
+
+// ---------------- MEMES -----------------
+
+const createMemeHandler = async (req: any, res: any) => {
+  const { wallet, imageUrl, caption, isRegeneration } = req.body;
+  if (!wallet || !imageUrl)
+    return res.status(400).json({ error: "Missing fields" });
+
+  try {
+    const cost = isRegeneration ? 2.5 : 5;
+
+    const [result]: any = await pool.query(
+      `
+      UPDATE users 
+      SET tbot_balance = tbot_balance - ? 
+      WHERE wallet_address = ? AND tbot_balance >= ?
+    `,
+      [cost, wallet, cost]
+    );
+
+    if (result.affectedRows === 0)
+      return res
+        .status(400)
+        .json({ error: "Insufficient TBOT balance" });
+
+    await pool.query(
+      "INSERT INTO memes (creator_wallet, image_url, caption) VALUES (?, ?, ?)",
+      [wallet, imageUrl, caption]
+    );
+
+    broadcastNewMeme({ wallet, imageUrl, caption });
+    broadcastLeaderboardUpdate();
+
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: "Server error" });
+  }
+};
+
+// ---------------- AI ENDPOINTS -----------------
+
+const generateImageHandler = async (req: any, res: any) => {
+  const { prompt } = req.body;
+  if (!prompt)
+    return res.status(400).json({ error: "Prompt required" });
+
+  try {
+    const response = await ai.models.generateImages({
+      model: "imagen-3.0-generate-002",
+      prompt: `A funny meme about ${prompt}. High quality digital art.`,
+      config: { numberOfImages: 1, aspectRatio: "1:1" },
+    });
+
+    const bytes =
+      response.generatedImages?.[0]?.image?.imageBytes;
+    if (!bytes) throw new Error("No image generated");
+
+    res.json({ imageUrl: `data:image/png;base64,${bytes}` });
+  } catch (e: any) {
+    res.status(500).json({ error: e.message });
+  }
+};
+
+const chatHandler = async (req: any, res: any) => {
+  const { message } = req.body;
+  if (!message)
+    return res.status(400).json({ error: "Message required" });
+
+  try {
+    const reply = await ai.models.generateContent({
+      model: "gemini-2.5-flash",
+      contents: message,
+      config: {
+        systemInstruction:
+          "You are ThinkBot, witty sarcastic crypto meme AI.",
+      },
+    });
+
+    res.json({ response: reply.text });
+  } catch (e) {
+    res.status(500).json({ error: "AI failed" });
+  }
+};
+
+// ---------------- BATTLE -----------------
+
+const battleEnterHandler = async (req: any, res: any) => {
+  const { wallet, memeId } = req.body;
+
+  try {
+    const cost = 5;
+    const [result]: any = await pool.query(
+      `
+      UPDATE users 
+      SET tbot_balance = tbot_balance - ?
+      WHERE wallet_address = ? AND tbot_balance >= ?
+    `,
+      [cost, wallet, cost]
+    );
+
+    if (result.affectedRows === 0)
+      return res.status(400).json({ error: "Insufficient funds" });
+
+    await pool.query(
+      "INSERT INTO battle_entries (submitter_wallet, meme_id) VALUES (?, ?)",
+      [wallet, memeId]
+    );
+
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: "DB error" });
+  }
+};
+
+const battleVoteHandler = async (req: any, res: any) => {
+  const { wallet, entryId } = req.body;
+
+  try {
+    await pool.query(
+      "INSERT INTO battle_votes (voter_wallet, battle_entry_id) VALUES (?, ?)",
+      [wallet, entryId]
+    );
+
+    const [[{ votes }]]: any = await pool.query(
+      "SELECT COUNT(*) AS votes FROM battle_votes WHERE battle_entry_id = ?",
+      [entryId]
+    );
+
+    broadcastBattleUpdate(entryId, votes);
+    broadcastLeaderboardUpdate();
+
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: "Vote failed" });
+  }
+};
+
+// ---------------- HEIST -----------------
+
+const heistStartHandler = async (req: any, res: any) => {
+  const { wallet } = req.body;
+
+  try {
+    const cost = 0.5;
+
+    const [result]: any = await pool.query(
+      `
+      UPDATE users 
+      SET tbot_balance = tbot_balance - ?
+      WHERE wallet_address = ? AND tbot_balance >= ?
+    `,
+      [cost, wallet, cost]
+    );
+
+    if (result.affectedRows === 0)
+      return res.status(400).json({ error: "Insufficient funds" });
+
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: "Heist error" });
+  }
+};
+
+const heistScoreHandler = async (req: any, res: any) => {
+  const { wallet, score } = req.body;
+
+  try {
+    await pool.query(
+      "UPDATE users SET neuts_balance = neuts_balance + ? WHERE wallet_address = ?",
+      [score, wallet]
+    );
+
+    await pool.query(
+      "INSERT INTO heist_scores (player_wallet, score) VALUES (?, ?)",
+      [wallet, score]
+    );
+
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: "Score error" });
+  }
+};
+
+// ---------------- CONVERT -----------------
+
+const convertHandler = async (req: any, res: any) => {
+  const { wallet, amountNeuts } = req.body;
+  if (amountNeuts % 100 !== 0)
+    return res.status(400).json({ error: "Must be multiple of 100" });
+
+  try {
+    const tbot = amountNeuts / 100;
+
+    const [result]: any = await pool.query(
+      `
+      UPDATE users 
+      SET neuts_balance = neuts_balance - ?, 
+          tbot_balance = tbot_balance + ?
+      WHERE wallet_address = ? AND neuts_balance >= ?
+    `,
+      [amountNeuts, tbot, wallet, amountNeuts]
+    );
+
+    if (result.affectedRows === 0)
+      return res.status(400).json({ error: "Insufficient NEUTS" });
+
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: "Conversion failed" });
+  }
+};
+
+// ---------------- LEADERBOARDS -----------------
+
+const leaderboardHandler = async (req: any, res: any) => {
+  try {
+    const [rows]: any = await pool.query(
+      `
+      SELECT wallet_address AS wallet, leaderboard_score AS score 
+      FROM users 
+      ORDER BY leaderboard_score DESC 
+      LIMIT 10
+    `
+    );
+    res.json(rows);
+  } catch (e) {
+    res.status(500).json({ error: "Leaderboard error" });
+  }
+};
+
+const heistLeaderboardHandler = async (req: any, res: any) => {
+  try {
+    const [rows]: any = await pool.query(
+      `
+      SELECT player_wallet AS wallet, MAX(score) AS score
+      FROM heist_scores
+      GROUP BY player_wallet
+      ORDER BY score DESC
+      LIMIT 10
+    `
+    );
+    res.json(rows);
+  } catch (e) {
+    res.status(500).json({ error: "Heist leaderboard error" });
+  }
+};
+
+const mintHandler = async (req: any, res: any) => {
+    const { wallet } = req.body;
+    if (!wallet) return res.status(400).json({ error: "Wallet required" });
+
+    try {
+        const cost = 50;
+        const [result] = await pool.query(
+            'UPDATE users SET tbot_balance = tbot_balance - ? WHERE wallet_address = ? AND tbot_balance >= ?',
+            [cost, wallet, cost]
+        );
+
+        if ((result as any).affectedRows === 0) {
+            return res.status(400).json({ error: 'Insufficient TBOT balance' });
+        }
+
+        await pool.query('INSERT INTO nfts (wallet_address) VALUES (?)', [wallet]);
+        await pool.query(
+            'UPDATE users SET leaderboard_score = leaderboard_score + 100 WHERE wallet_address = ?',
+            [wallet]
+        );
+
+        // broadcast update
+        broadcastLeaderboardUpdate();
+
+        res.json({ success: true, message: "Minted successfully" });
+    } catch (error) {
+        res.status(500).json({ error: 'Minting failed' });
+    }
+};
+
+
+// ------------------------------------------------------
+//                    ROUTES
+// ------------------------------------------------------
+
+app.get("/api/health", healthHandler);
+app.get("/api/stats", statsHandler);
+
+app.post("/api/auth/login", loginHandler);
+app.post("/api/auth/logout", logoutHandler);
+
+app.post("/api/balance", balanceHandler);
+app.post("/api/memes", createMemeHandler);
+
+app.post("/api/ai/generate-image", generateImageHandler);
+app.post("/api/ai/chat", chatHandler);
+
+app.post("/api/mint", mintHandler);
+
+app.post("/api/battle/enter", battleEnterHandler);
+app.post("/api/battle/vote", battleVoteHandler);
+
+app.post("/api/heist/start", heistStartHandler);
+app.post("/api/heist/score", heistScoreHandler);
+
+app.post("/api/convert", convertHandler);
+app.post("/api/deposit/verify", depositVerifyHandler);
+app.post("/api/withdraw", withdrawHandler);
+
+app.get("/api/leaderboard", leaderboardHandler);
+app.get("/api/heist/leaderboard", heistLeaderboardHandler);
+
+// ------------------------------------------------------
+//                    WEBSOCKETS
+// ------------------------------------------------------
 
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
-let lastActiveCount = 0;
-
-function wsBroadcast(obj: any) {
-    const msg = JSON.stringify(obj);
-    wss.clients.forEach((client: any) => {
-        if (client.readyState === 1) client.send(msg);
-    });
-}
-
-function broadcastActiveUsers(count: number) {
-    const delta = count - lastActiveCount;
-    lastActiveCount = count;
-
-    wsBroadcast({ type: "activeUsers", count, delta });
-}
-
+// --- Broadcast Helpers ---
 function broadcastLeaderboardUpdate() {
-    wsBroadcast({ type: "leaderboardUpdate" });
+  const msg = JSON.stringify({ type: "leaderboardUpdate" });
+
+  wss.clients.forEach((c: any) => {
+    if (c.readyState === 1) c.send(msg);
+  });
 }
 
 function broadcastNewMeme(meme: any) {
-    wsBroadcast({ type: "newMeme", meme });
+  const msg = JSON.stringify({ type: "newMeme", meme });
+
+  wss.clients.forEach((c: any) => {
+    if (c.readyState === 1) c.send(msg);
+  });
 }
 
 function broadcastBattleUpdate(entryId: string, votes: number) {
-    wsBroadcast({ type: "battleUpdate", entryId, votes });
+  const msg = JSON.stringify({
+    type: "battleUpdate",
+    entryId,
+    votes,
+  });
+
+  wss.clients.forEach((c: any) => {
+    if (c.readyState === 1) c.send(msg);
+  });
 }
 
-/* -------------------------------------------------------------------------- */
-/*                               ROUTE HANDLERS                               */
-/* -------------------------------------------------------------------------- */
+console.log("🔥 WebSocket Broadcast System Ready");
 
-app.get("/api/health", (req, res) =>
-    res.json({ status: "ok", time: new Date() })
-);
-
-/* --------------------------- Stats Handler --------------------------- */
-
-app.get("/api/stats", async (req, res) => {
-    try {
-        const [memeRows] = await pool.query(
-            "SELECT COUNT(*) AS count FROM memes"
-        );
-        const [nftRows] = await pool.query(
-            "SELECT COUNT(*) AS count FROM nfts"
-        );
-        const [activeRows] = await pool.query(
-            "SELECT COUNT(*) AS count FROM users WHERE is_online = 1"
-        );
-
-        res.json({
-            memesForged: (memeRows as any)[0].count || 0,
-            nftsMinted: (nftRows as any)[0].count || 0,
-            activeUsers: (activeRows as any)[0].count || 0,
-        });
-    } catch (err) {
-        console.error("Stats error:", err);
-        res.json({ memesForged: 0, nftsMinted: 0, activeUsers: 0 });
-    }
-});
-
-/* --------------------------- Login / Logout --------------------------- */
-
-app.post("/api/auth/login", async (req, res) => {
-    const { walletAddress } = req.body;
-    if (!walletAddress)
-        return res.status(400).json({ error: "Wallet required" });
-
-    try {
-        await pool.query(
-            "INSERT INTO users (wallet_address, last_login) VALUES (?, NOW()) ON DUPLICATE KEY UPDATE last_login = NOW()",
-            [walletAddress]
-        );
-
-        await pool.query(
-            "UPDATE users SET is_online = 1 WHERE wallet_address = ?",
-            [walletAddress]
-        );
-
-        const [rows] = await pool.query(
-            "SELECT COUNT(*) AS count FROM users WHERE is_online = 1"
-        );
-        broadcastActiveUsers((rows as any)[0].count);
-
-        res.json({ success: true });
-    } catch (err) {
-        console.error("Login error:", err);
-        res.status(500).json({ error: "DB error" });
-    }
-});
-
-app.post("/api/auth/logout", async (req, res) => {
-    const { walletAddress } = req.body;
-
-    if (!walletAddress)
-        return res.status(400).json({ error: "Wallet required" });
-
-    try {
-        await pool.query(
-            "UPDATE users SET is_online = 0 WHERE wallet_address = ?",
-            [walletAddress]
-        );
-
-        const [rows] = await pool.query(
-            "SELECT COUNT(*) AS count FROM users WHERE is_online = 1"
-        );
-        broadcastActiveUsers((rows as any)[0].count);
-
-        res.json({ success: true });
-    } catch (err) {
-        console.error("Logout error:", err);
-        res.status(500).json({ error: "DB error" });
-    }
-});
-
-/* --------------------------- Meme Creation --------------------------- */
-
-app.post("/api/memes", async (req, res) => {
-    const { wallet, imageUrl, caption, isRegeneration } = req.body;
-
-    if (!wallet || !imageUrl)
-        return res.status(400).json({ error: "Missing fields" });
-
-    try {
-        const cost = isRegeneration ? 2.5 : 5;
-
-        const [rows] = await pool.query(
-            "UPDATE users SET tbot_balance = tbot_balance - ? WHERE wallet_address = ? AND tbot_balance >= ?",
-            [cost, wallet, cost]
-        );
-
-        if ((rows as any).affectedRows === 0) {
-            return res.status(400).json({ error: "Insufficient TBOT" });
-        }
-
-        await pool.query(
-            "INSERT INTO memes (creator_wallet, image_url, caption) VALUES (?, ?, ?)",
-            [wallet, imageUrl, caption]
-        );
-
-        broadcastNewMeme({ wallet, imageUrl, caption });
-        broadcastLeaderboardUpdate();
-
-        res.json({ success: true });
-    } catch (err) {
-        console.error("Meme error:", err);
-        res.status(500).json({ error: "Server error" });
-    }
-});
-
-/* --------------------------- AI Image Gen --------------------------- */
-
-app.post("/api/ai/generate-image", async (req, res) => {
-    const { prompt } = req.body;
-
-    if (!prompt) return res.status(400).json({ error: "Prompt required" });
-
-    try {
-        const response = await ai.models.generateImages({
-            model: "imagen-3.0-generate-002",
-            prompt: `A funny meme about ${prompt}. High quality, digital art style.`,
-            config: { numberOfImages: 1, aspectRatio: "1:1" },
-        });
-
-        const b64 =
-            response.generatedImages?.[0]?.image?.imageBytes;
-
-        if (!b64) throw new Error("No image");
-
-        res.json({ imageUrl: `data:image/png;base64,${b64}` });
-    } catch (err: any) {
-        console.error("AI error:", err);
-        res.status(500).json({ error: err.message });
-    }
-});
-
-/* --------------------------- Chat AI --------------------------- */
-
-app.post("/api/ai/chat", async (req, res) => {
-    const { message } = req.body;
-    if (!message)
-        return res.status(400).json({ error: "Message required" });
-
-    try {
-        const output = await ai.models.generateContent({
-            model: "gemini-2.5-flash",
-            contents: message,
-            config: {
-                systemInstruction:
-                    "You are ThinkBot. Be funny, helpful, sarcastic, keep answers short.",
-            },
-        });
-
-        res.json({ response: output.text });
-    } catch (err) {
-        res.status(500).json({ error: "AI error" });
-    }
-});
-
-/* -------------------------- Leaderboards -------------------------- */
-
-app.get("/api/leaderboard", async (req, res) => {
-    const [rows] = await pool.query(
-        "SELECT wallet_address AS wallet, leaderboard_score AS score FROM users ORDER BY score DESC LIMIT 10"
-    );
-    res.json(rows);
-});
-
-app.get("/api/heist/leaderboard", async (req, res) => {
-    const [rows] = await pool.query(
-        `SELECT player_wallet AS wallet, MAX(score) as score
-         FROM heist_scores
-         GROUP BY player_wallet
-         ORDER BY score DESC
-         LIMIT 10`
-    );
-    res.json(rows);
-});
-
-/* ------------------------ Battle Voting ------------------------- */
-
-app.post("/api/battle/enter", async (req, res) => {
-    const { wallet, memeId } = req.body;
-
-    const cost = 5;
-
-    const [rows] = await pool.query(
-        "UPDATE users SET tbot_balance = tbot_balance - ? WHERE wallet_address = ? AND tbot_balance >= ?",
-        [cost, wallet, cost]
-    );
-
-    if ((rows as any).affectedRows === 0)
-        return res.status(400).json({ error: "Insufficient funds" });
-
-    await pool.query(
-        "INSERT INTO battle_entries (submitter_wallet, meme_id) VALUES (?, ?)",
-        [wallet, memeId]
-    );
-
-    res.json({ success: true });
-});
-
-app.post("/api/battle/vote", async (req, res) => {
-    const { wallet, entryId } = req.body;
-
-    try {
-        await pool.query(
-            "INSERT INTO battle_votes (voter_wallet, battle_entry_id) VALUES (?, ?)",
-            [wallet, entryId]
-        );
-
-        const [rows] = await pool.query(
-            "SELECT COUNT(*) AS votes FROM battle_votes WHERE battle_entry_id = ?",
-            [entryId]
-        );
-
-        const votes = (rows as any)[0].votes;
-        broadcastBattleUpdate(entryId, votes);
-        broadcastLeaderboardUpdate();
-
-        res.json({ success: true });
-    } catch {
-        res.status(500).json({ error: "Vote failed" });
-    }
-});
-
-/* -------------------------------------------------------------------------- */
-/*                              START THE SERVER                              */
-/* -------------------------------------------------------------------------- */
+// ------------------------------------------------------
+//                    START SERVER
+// ------------------------------------------------------
 
 server.listen(PORT, () => {
-    console.log(`🚀 Server + WebSocket running on port ${PORT}`);
+  console.log(`🚀 Server running on port ${PORT}`);
 });
