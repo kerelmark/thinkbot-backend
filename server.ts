@@ -12,7 +12,10 @@ import bs58 from "bs58";
 import nacl from "tweetnacl";
 import { GoogleGenAI } from "@google/genai";
 import http from "http";
-import { WebSocketServer } from "ws";
+import WebSocket from "ws";
+
+// @ts-ignore
+const WebSocketServer = WebSocket.Server;
 
 dotenv.config();
 

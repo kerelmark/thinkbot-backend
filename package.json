@@ -17,8 +17,8 @@
     "express": "^4.19.2",
     "mysql2": "^3.9.7",
     "tweetnacl": "^1.0.3",
-
-    "typescript": "^5.9.3"
+    "typescript": "^5.9.3",
+    "ws": "^7.5.10"
   },
   "devDependencies": {
     "@types/cors": "^2.8.17",

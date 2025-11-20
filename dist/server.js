@@ -13,7 +13,9 @@ const bs58_1 = __importDefault(require("bs58"));
 const tweetnacl_1 = __importDefault(require("tweetnacl"));
 const genai_1 = require("@google/genai");
 const http_1 = __importDefault(require("http"));
-const ws_1 = require("ws");
+const ws_1 = __importDefault(require("ws"));
+// @ts-ignore
+const WebSocketServer = ws_1.default.Server;
 dotenv_1.default.config();
 const app = (0, express_1.default)();
 const PORT = process.env.PORT || 3001;
@@ -542,7 +544,7 @@ app.get("/api/heist/leaderboard", heistLeaderboardHandler);
 //                    WEBSOCKETS
 // ------------------------------------------------------
 const server = http_1.default.createServer(app);
-const wss = new ws_1.WebSocketServer({ server });
+const wss = new WebSocketServer({ server });
 // --- Broadcast Helpers ---
 function broadcastLeaderboardUpdate() {
     const msg = JSON.stringify({ type: "leaderboardUpdate" });
